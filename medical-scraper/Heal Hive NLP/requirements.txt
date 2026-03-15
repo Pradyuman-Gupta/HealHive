@@ -1,0 +1,29 @@
+# API Server
+fastapi
+uvicorn[standard]
+pydantic
+
+# LangChain Core
+langchain
+langchain-core
+langchain-text-splitters
+langchain-community
+
+# Hugging Face Integration
+langchain-huggingface
+transformers
+huggingface-hub
+
+# Vector Store (for RAG)
+faiss-cpu
+sentence-transformers
+
+# Environment Variable Management
+python-dotenv
+
+# HTTP client
+requests
+
+# Machine Learning Utilities
+numpy
+scikit-learn
