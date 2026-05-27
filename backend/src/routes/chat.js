@@ -1,5 +1,5 @@
 const express = require("express");
-const axios = require("axios");
+const { GoogleGenerativeAI } = require("@google/generative-ai");
 const { optionalAuth } = require("../middleware/auth");
 const { SOURCES } = require("../config/sources");
 const { DEFAULT_KEYWORDS } = require("../config/keywords");
@@ -12,13 +12,29 @@ const logger = require("../utils/logger");
 
 const router = express.Router();
 
-const AI_SERVER = process.env.AI_SERVER_URL || "http://localhost:8000";
+// Initialize Google Generative AI client
+const geminiApiKey = process.env.GEMINI_API_KEY;
+let genAI = null;
+if (geminiApiKey) {
+  genAI = new GoogleGenerativeAI(geminiApiKey);
+  logger.info("[Chat] Google Generative AI client initialized successfully.");
+} else {
+  logger.warn("[Chat] GEMINI_API_KEY environment variable is not set. Chat will operate in fallback mode.");
+}
 
 const SCRAPER_MAP = {
   pubmed: PubMedScraper,
   medline: MedlineScraper,
   who: WHOScraper,
 };
+
+// Helper function to extract unique source URLs
+function listUniqueUrls(results) {
+  const urls = results
+    .map((r) => r.url)
+    .filter((u) => u && typeof u === "string" && u.trim().length > 0);
+  return [...new Set(urls)];
+}
 
 // ── Internal scrape helper ───────────────────────────────────────────────────
 async function scrapeForKeywords(keywords) {
@@ -100,20 +116,44 @@ router.post("/", optionalAuth, async (req, res) => {
   logger.info(`[Chat] Message from ${req.user?.email || "guest"}: "${userMessage.substring(0, 60)}"`);
 
   try {
-    // ── Step 1: Extract keywords via HealHive NLP ────────────────────────────
+    // ── Step 1: Extract keywords via Gemini ──────────────────────────────────
     let keywords = [];
     let isHealthQuery = true;
 
-    try {
-      const kwRes = await axios.post(
-        `${AI_SERVER}/extract-keywords`,
-        { query: userMessage },
-        { timeout: 30000 }
-      );
-      keywords = kwRes.data.keywords || [];
-    } catch (aiErr) {
-      logger.warn(`[Chat] AI keyword extraction failed: ${aiErr.message}. Falling back to message words.`);
-      // Fallback: use the message words as keywords
+    if (genAI) {
+      try {
+        const model = genAI.getGenerativeModel({
+          model: "gemini-1.5-flash",
+          generationConfig: {
+            responseMimeType: "application/json",
+            responseSchema: {
+              type: "array",
+              items: { type: "string" }
+            }
+          }
+        });
+
+        const prompt = `You are a medical AI assistant. Extract important medical/health-related keywords from the user's query that would be useful for searching medical databases like PubMed. If the query is completely unrelated to health, medicine, symptoms, or medical advice, return an empty array.
+
+User Query: "${userMessage}"`;
+
+        const result = await model.generateContent(prompt);
+        const text = result.response.text();
+        keywords = JSON.parse(text);
+        if (!Array.isArray(keywords)) {
+          keywords = [];
+        }
+      } catch (aiErr) {
+        logger.warn(`[Chat] Gemini keyword extraction failed: ${aiErr.message}. Falling back to message words.`);
+        // Fallback: use the message words as keywords
+        keywords = userMessage
+          .toLowerCase()
+          .split(/\s+/)
+          .filter((w) => w.length > 3)
+          .slice(0, 5);
+      }
+    } else {
+      // Fallback: use message words directly
       keywords = userMessage
         .toLowerCase()
         .split(/\s+/)
@@ -121,7 +161,7 @@ router.post("/", optionalAuth, async (req, res) => {
         .slice(0, 5);
     }
 
-    // If AI returned empty keywords, it's not a health query
+    // If AI returned empty keywords or fallback was empty, it's not a health query
     if (keywords.length === 0) {
       isHealthQuery = false;
       return res.json({
@@ -142,25 +182,82 @@ router.post("/", optionalAuth, async (req, res) => {
       logger.warn(`[Chat] Scraping failed: ${scrapeErr.message}`);
     }
 
-    // ── Step 3: Analyze papers via HealHive NLP ──────────────────────────────
+    // ── Step 3: Analyze papers via Gemini ────────────────────────────────────
     let report = null;
     let formattedReply = "";
 
     if (scraperResults.length > 0) {
-      try {
-        const analyzeRes = await axios.post(
-          `${AI_SERVER}/analyze-papers`,
-          {
-            query: userMessage,
-            papers: { results: scraperResults.slice(0, 15) }, // cap at 15 to avoid overload
-          },
-          { timeout: 120000 } // 2 min timeout for AI analysis
-        );
-        report = analyzeRes.data;
-        formattedReply = formatAIResponse(report, report.source_references || []);
-      } catch (analyzeErr) {
-        logger.warn(`[Chat] AI analysis failed: ${analyzeErr.message}`);
-        // Fallback: give a basic response based on scraper data
+      if (genAI) {
+        try {
+          const model = genAI.getGenerativeModel({
+            model: "gemini-1.5-flash",
+            generationConfig: {
+              responseMimeType: "application/json",
+              responseSchema: {
+                type: "object",
+                properties: {
+                  query_summary: { type: "string" },
+                  treatment_overview: { type: "string" },
+                  common_side_effects: {
+                    type: "array",
+                    items: { type: "string" }
+                  },
+                  recovery_timeline: { type: "string" },
+                  sentiment_analysis: {
+                    type: "object",
+                    properties: {
+                      positive_experiences: { type: "string" },
+                      negative_experiences: { type: "string" }
+                    },
+                    required: ["positive_experiences", "negative_experiences"]
+                  },
+                  credibility_score: { type: "integer" }
+                },
+                required: [
+                  "query_summary",
+                  "treatment_overview",
+                  "common_side_effects",
+                  "recovery_timeline",
+                  "sentiment_analysis",
+                  "credibility_score"
+                ]
+              }
+            }
+          });
+
+          const papersText = scraperResults.slice(0, 15).map((paper, idx) => {
+            return `[Paper ${idx + 1}]
+Title: ${paper.title}
+Summary/Abstract: ${paper.summary || paper.abstract || "N/A"}
+Source: ${paper.source || "N/A"}`;
+          }).join("\n\n");
+
+          const prompt = `You are a medical research assistant. Analyze the following medical papers/articles to answer the user's query: "${userMessage}".
+
+Context (scraped papers):
+${papersText}
+
+Based on the provided context, generate a structured analysis matching the requested JSON schema.
+Each string field in the JSON response MUST be extremely brief (maximum 1 short sentence). Avoid long paragraphs and verbose explanations. Keep side effects limited to at most 3 concise items.
+If the context doesn't contain specific recovery timeline or side effects, use general clinical knowledge to fill them in very briefly (e.g. "Usually 3-5 days" or "Mild gastrointestinal upset").
+Evaluate the evidence strength and quality from the papers to assign a credibility_score from 0 (very low/untrustworthy) to 10 (very high/strong evidence).`;
+
+          const result = await model.generateContent(prompt);
+          const text = result.response.text();
+          report = JSON.parse(text);
+
+          const sources = listUniqueUrls(scraperResults.slice(0, 15));
+          report.source_references = sources;
+          formattedReply = formatAIResponse(report, sources);
+        } catch (analyzeErr) {
+          logger.warn(`[Chat] Gemini analysis failed: ${analyzeErr.message}`);
+          const topResult = scraperResults[0];
+          formattedReply = topResult
+            ? `Based on medical literature, here's what I found about "${userMessage}":\n\n**${topResult.title}**\n\n${topResult.summary || topResult.abstract || "No summary available."}\n\n🔗 ${topResult.url || ""}`
+            : `I found some information about "${userMessage}" but couldn't generate a detailed analysis. Please consult a healthcare professional.`;
+        }
+      } else {
+        // Fallback without Gemini API key
         const topResult = scraperResults[0];
         formattedReply = topResult
           ? `Based on medical literature, here's what I found about "${userMessage}":\n\n**${topResult.title}**\n\n${topResult.summary || topResult.abstract || "No summary available."}\n\n🔗 ${topResult.url || ""}`
